@@ -20,8 +20,20 @@
 # docs/arm-pretool-check.md for the blessed tree and deny reason codes. It is a
 # pre-execution seatbelt, not a substitute for the verification here.
 #
-# This script forks the watcher as a tracked child, then VERIFIES the outcome
-# before it settles in. It confirms a watcher process is genuinely alive AND the
+# This script launches the watcher DETACHED in its own session (perl
+# POSIX::setsid + exec; setsid(1) is absent on macOS bash) so the watcher's
+# lifetime is INDEPENDENT of this arm, then VERIFIES the outcome before it settles
+# in. exec keeps $! equal to the watcher's real pid, so the arm still `wait`s on
+# it (which is what makes the harness re-notify firstmate when the watcher wakes
+# and exits) and lock-identity confirmation, `wait`, and --restart all target the
+# true watcher. The point of the detach is the reap: the harness reaps this arm
+# (its tracked background task) every minute or two with SIGTERM, and a detached
+# watcher SURVIVES that reap - it keeps beating and holding the lock, and the next
+# arm attaches to it, so supervision is never dropped between re-arms. Durable
+# wake delivery never depends on this arm at all: fm-watch.sh enqueues every wake
+# to state/.wake-queue before it prints and exits, and firstmate drains that queue
+# at the start of every turn.
+# It confirms a watcher process is genuinely alive AND the
 # liveness beacon (state/.last-watcher-beat) is fresh within FM_GUARD_GRACE (the
 # single source of truth, shared with fm-watch.sh and fm-guard.sh), and prints
 # exactly one unambiguous status line:
@@ -357,18 +369,32 @@ if [ "$mode" = arm ] && healthy_watcher; then
   exit $?
 fi
 
-# Start a watcher as a tracked child and confirm it before settling in. The child
-# stays our child for its whole life: we wait on it, so killing this arm (the
-# harness-tracked task) tears the watcher down too, and the watcher's eventual
-# wake exit propagates out so the harness re-notifies firstmate.
+# Launch the watcher DETACHED and confirm it before settling in. It runs in its
+# own session (perl POSIX::setsid + exec), so it OUTLIVES this arm: when the
+# harness reaps this tracked background task with SIGTERM, the watcher keeps
+# beating and holding the lock, and the next arm attaches to it. $child holds the
+# watcher's real pid (exec preserves $!), so the arm still `wait`s on it for the
+# harness push and can still stop an unconfirmed launch on the timeout path. On a
+# clean signal the arm exits WITHOUT touching the watcher - tearing it down is the
+# exact reaping bug this detach fixes.
 child=
 child_out=
-cleanup_child() {
-  if [ -n "$child" ] && fm_pid_alive "$child"; then
-    kill -TERM "$child" 2>/dev/null || true
-  fi
+# Remove only the temp output. NEVER kill $child here: the watcher is detached
+# and must survive an arm signal/reap. The confirmation-timeout path that wants
+# to stop an unconfirmed launch does so explicitly via stop_unconfirmed_child.
+cleanup_child_output() {
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
+  fi
+}
+
+# Stop a watcher this arm launched but could NEVER confirm healthy (the
+# confirmation-timeout fallback only). Signaling the real watcher pid releases its
+# lock so the next arm starts clean instead of colliding with a wedged launch.
+# This is never called on the signal/reap path, where the watcher must survive.
+stop_unconfirmed_child() {
+  if [ -n "$child" ] && fm_pid_alive "$child"; then
+    kill -TERM "$child" 2>/dev/null || true
   fi
 }
 
@@ -376,12 +402,11 @@ cleanup_child() {
 handle_arm_signal() {
   local signal=$1 rc=$2
   trap - HUP TERM INT
-  if [ -n "$child" ] && fm_pid_alive "$child"; then
-    kill -TERM "$child" 2>/dev/null || true
-    wait "$child" 2>/dev/null || true
-  fi
+  # The watcher is detached and must OUTLIVE this arm: record the interrupted
+  # cycle and exit without signaling $child. This is the reaping fix - a harness
+  # SIGTERM to this arm no longer takes supervision down with it.
   cycle_log_append "$rc" "$signal" arm-interrupted none
-  cleanup_child
+  cleanup_child_output
   exit "$rc"
 }
 
@@ -393,7 +418,12 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-"$WATCH" >"$child_out" &
+# Detach the watcher into its own session so it outlives this arm's reaping.
+# setsid(1) is not present on macOS bash 3.2; perl's POSIX::setsid is. exec keeps
+# $! equal to the watcher's real pid, so `wait "$child"` below still reaps the
+# real watcher and returns its true exit code for the harness push path.
+# shellcheck disable=SC2016  # single quotes are deliberate: perl expands its own $ARGV.
+perl -e 'use POSIX (); POSIX::setsid(); exec { $ARGV[0] } @ARGV; exit 127;' "$WATCH" >"$child_out" 2>&1 &
 child=$!
 cycle_begin "$child" started
 child_done=0
@@ -484,7 +514,12 @@ done
 
 trap - HUP TERM INT
 print_watch_output "$child_out"
-cleanup_child
+# The launch was never confirmed healthy within the deadline. Stop that
+# unconfirmed watcher so its lock is released and the next arm starts clean; this
+# is the ONLY path that stops the detached watcher, and only because it is not a
+# confirmed member of the supervision chain.
+stop_unconfirmed_child
+cleanup_child_output
 wait "$child" 2>/dev/null
 rc=$?
 cycle_log_append "$rc" "$(cycle_signal_name "$rc")" confirmation-timeout none

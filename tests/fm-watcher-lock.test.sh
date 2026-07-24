@@ -656,13 +656,19 @@ test_arm_starts_and_self_heals() {
   pass "arm starts+confirms a fresh watcher on a clean lock and self-heals a dead-pid lock (never healthy off a dead pid)"
 }
 
-test_arm_hup_cleans_child_and_temp_output() {
+test_arm_hup_survives_watcher_and_cleans_temp_output() {
+  # The watcher is launched DETACHED, so it must OUTLIVE its arm: when the arm is
+  # signaled (HUP here, the same shape as the harness reaping the tracked task
+  # with TERM), the watcher keeps beating and holding the lock so the next arm can
+  # attach. The arm still removes its own temp output on the way out.
   local dir state fakebin armout i armpid lock_pid status
   dir=$(make_case arm-hup-cleanup)
   state="$dir/state"
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
-  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  # A fast poll makes the liveness beacon refresh often, so a short idle wait
+  # after the arm dies discriminates a still-beating watcher from a torn-down one.
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
   armpid=$!
   i=0
   while [ "$i" -lt 80 ]; do
@@ -670,20 +676,85 @@ test_arm_hup_cleans_child_and_temp_output() {
     sleep 0.1
     i=$((i + 1))
   done
-  grep -qF 'watcher: started pid=' "$armout" || fail "arm did not start before HUP cleanup check"
+  grep -qF 'watcher: started pid=' "$armout" || fail "arm did not start before HUP survival check"
   lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$lock_pid" ] || fail "watcher took no lock before HUP"
   kill -HUP "$armpid" 2>/dev/null || fail "could not send HUP to arm"
   wait_for_exit "$armpid" 80
   status=$?
   [ "$status" -eq 129 ] || fail "arm did not exit with HUP status (got $status)"
+  # The detached watcher must still be alive and holding its lock after the arm
+  # died - the whole point of the reaping fix.
+  is_live_non_zombie "$lock_pid" || fail "HUP tore the detached watcher down with its arm"
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$lock_pid" ] || fail "detached watcher lost its lock when the arm was signaled"
+  # And it must KEEP BEATING with no arm attached: drop a reference marker, idle
+  # past the poll interval, and require the beacon to have been touched AFTER the
+  # marker (a torn-down watcher would never refresh it again).
+  touch "$state/.beat-ref"
+  sleep 3
+  [ "$state/.last-watcher-beat" -nt "$state/.beat-ref" ] || fail "detached watcher stopped beating after its arm was signaled"
+  ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 || fail "HUP left temp output behind"
+  kill "$lock_pid" 2>/dev/null || true
+  wait "$lock_pid" 2>/dev/null || true
+  pass "detached watcher survives its arm's signal and keeps the lock while the arm cleans its temp output"
+}
+
+test_watcher_survives_arm_term_reap_and_next_arm_reattaches() {
+  # Regression for the reaping bug: the harness reaps the tracked arm task with
+  # SIGTERM every minute or two. The watcher is launched detached, so that reap
+  # must NOT drop supervision - the watcher keeps beating and holding its lock,
+  # and the NEXT arm attaches to the very same live watcher. This is the full
+  # continuity contract, not just single-signal survival.
+  local dir state fakebin armout1 armout2 i armpid1 armpid2 status lock_pid
+  dir=$(make_case arm-term-reap-continuity)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout1="$dir/arm1.out"
+  armout2="$dir/arm2.out"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout1" &
+  armpid1=$!
   i=0
-  while [ "$i" -lt 80 ] && is_live_non_zombie "$lock_pid"; do
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$armout1" 2>/dev/null && break
     sleep 0.1
     i=$((i + 1))
   done
-  ! is_live_non_zombie "$lock_pid" || fail "HUP cleanup left watcher child running"
-  ! ls "$state"/.watch-arm-output.* >/dev/null 2>&1 || fail "HUP cleanup left temp output behind"
-  pass "arm cleans child watcher and temp output on HUP"
+  grep -qF 'watcher: started pid=' "$armout1" || fail "first arm did not start a watcher"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$lock_pid" ] || fail "watcher took no lock before reap"
+
+  # Reap the arm exactly as the harness does: SIGTERM the tracked task.
+  kill -TERM "$armpid1" 2>/dev/null || fail "could not TERM the first arm"
+  wait_for_exit "$armpid1" 80
+  status=$?
+  [ "$status" -eq 143 ] || fail "reaped arm did not exit with TERM status (got $status)"
+
+  # The detached watcher must survive the reap: same pid, same lock, still beating.
+  is_live_non_zombie "$lock_pid" || fail "reaping the arm tore the detached watcher down"
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$lock_pid" ] || fail "detached watcher lost its lock when its arm was reaped"
+  touch "$state/.beat-ref"
+  sleep 3
+  [ "$state/.last-watcher-beat" -nt "$state/.beat-ref" ] || fail "detached watcher stopped beating after its arm was reaped"
+
+  # Continuity: the next arm must ATTACH to the surviving watcher, never start a
+  # second one - supervision is unbroken across the reap.
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" > "$armout2" &
+  armpid2=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF "watcher: attached pid=$lock_pid" "$armout2" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$lock_pid" "$armout2" || fail "next arm did not re-attach to the surviving watcher: $(cat "$armout2")"
+  ! grep -qF 'watcher: started' "$armout2" || fail "next arm started a second watcher instead of attaching to the survivor"
+  ! grep -qF 'watcher: FAILED' "$armout2" || fail "next arm reported FAILED against the surviving watcher"
+
+  kill -TERM "$armpid2" 2>/dev/null || true
+  wait_for_exit "$armpid2" 80
+  kill "$lock_pid" 2>/dev/null || true
+  wait "$lock_pid" 2>/dev/null || true
+  pass "watcher survives its arm being reaped with SIGTERM and the next arm re-attaches to the same live watcher"
 }
 
 test_arm_propagates_immediate_wake_before_confirmation() {
@@ -829,8 +900,13 @@ SH
   grep -qF "watcher: started pid=$successor_pid" "$armout" || fail "successor ledger cycle did not start"
   grep -q "arm_pid=$first_arm.*successor=started:$successor_pid" "$state/.watch-cycle-exits.log" \
     || fail "predecessor ledger record was not linked to its verified successor"
+  # The watcher is detached, so signaling the arm no longer stops it. Stop it
+  # explicitly so the next arm starts a fresh cycle instead of attaching to this
+  # surviving watcher.
   kill -HUP "$successor_arm" 2>/dev/null || true
   wait "$successor_arm" 2>/dev/null || true
+  kill -TERM "$successor_pid" 2>/dev/null || true
+  wait_for_exit "$successor_pid" 40 >/dev/null 2>&1 || true
 
   # Produce enough short cycles to cross a deliberately small cap. The cap is
   # applied by the arm layer itself and keeps only complete ledger records.
@@ -846,8 +922,13 @@ SH
       i=$((i + 1))
     done
     grep -qF 'watcher: started pid=' "$armout" || fail "bounded ledger cycle $iteration did not start"
+    successor_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    # Same as above: signal the arm, then stop the detached watcher it started so
+    # the next iteration starts fresh rather than attaching.
     kill -HUP "$successor_arm" 2>/dev/null || true
     wait "$successor_arm" 2>/dev/null || true
+    kill -TERM "$successor_pid" 2>/dev/null || true
+    wait_for_exit "$successor_pid" 40 >/dev/null 2>&1 || true
     iteration=$((iteration + 1))
   done
   size=$(wc -c < "$state/.watch-cycle-exits.log" | tr -d '[:space:]')
@@ -977,7 +1058,8 @@ test_arm_self_eviction_is_loud_without_successor
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals
-test_arm_hup_cleans_child_and_temp_output
+test_arm_hup_survives_watcher_and_cleans_temp_output
+test_watcher_survives_arm_term_reap_and_next_arm_reattaches
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
