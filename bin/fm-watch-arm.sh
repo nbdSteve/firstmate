@@ -68,6 +68,13 @@
 # watcher. NEVER `pkill -f
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
 # (secondmate homes run the same script) and would kill siblings.
+# --shutdown: stop ONLY this FM_HOME's watcher and exit WITHOUT relaunching, for
+# a genuine full-session teardown. A routine arm reap must still leave the
+# detached watcher running (the reaping fix above); --shutdown is the deliberate
+# counterpart the SessionEnd hook calls when the whole owning session is going
+# away, so the watcher is stopped now instead of orphaned until the heartbeat
+# idle-exit backstop retires it. Both modes share stop_home_watcher, the single
+# owner of the home-scoped, identity-verified stop.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -330,31 +337,64 @@ print_watch_output() {
   [ -s "$out" ] && cat "$out"
 }
 
-mode=arm
-case "${1:-}" in
-  ''|arm|--arm) mode=arm ;;
-  --restart) mode=restart ;;
-  *) echo "usage: $(basename "$0") [--restart]" >&2; exit 2 ;;
-esac
-
-if [ "$mode" = restart ]; then
-  # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
+# Home-scoped stop of ONLY this FM_HOME's watcher: the pid recorded in this
+# home's state/.watch.lock, and only when the lock still IDENTIFIES that live pid
+# as this home's watcher. It never signals a reused/unrelated pid, never another
+# home's watcher, and never uses a broad pkill. Sets STOPPED_WATCHER_PID to the
+# pid it terminated and returns 0 only when it stopped a genuine live watcher; a
+# dead-pid lock is left for the arm's steal path (--restart) to reclaim, and a
+# live-but-foreign (reused) pid only has its stale lock cleared. This is the one
+# owner of the home-scoped stop, shared by --restart and --shutdown.
+STOPPED_WATCHER_PID=
+stop_home_watcher() {
+  local lock_pid i
+  STOPPED_WATCHER_PID=
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
     if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
       kill -TERM "$lock_pid" 2>/dev/null || true
-      # Wait for it to actually exit before relaunching, so the fresh watcher
-      # either takes a released lock or reclaims a now-dead-pid stale lock instead
-      # of seeing the dying one as a live holder and no-opping.
+      # Wait for it to actually exit so the lock is released (or left as a
+      # now-dead-pid stale lock) instead of naming a dying holder a later arm
+      # would mistake for a live watcher and no-op against.
       i=0
       while [ "$i" -lt 50 ] && fm_pid_alive "$lock_pid"; do
         sleep 0.1
         i=$((i + 1))
       done
-    else
-      clear_stale_recorded_watcher_lock
+      STOPPED_WATCHER_PID=$lock_pid
+      return 0
     fi
+    clear_stale_recorded_watcher_lock
   fi
+  return 1
+}
+
+mode=arm
+case "${1:-}" in
+  ''|arm|--arm) mode=arm ;;
+  --restart) mode=restart ;;
+  --shutdown) mode=shutdown ;;
+  *) echo "usage: $(basename "$0") [--restart|--shutdown]" >&2; exit 2 ;;
+esac
+
+if [ "$mode" = shutdown ]; then
+  # Full-session teardown ONLY: stop this home's watcher and exit without
+  # relaunching. This is the deliberate counterpart to the detached lifetime. A
+  # routine arm reap must leave the detached watcher running (that is the reaping
+  # fix, and it stays untouched), but when the whole session that owns this home
+  # is genuinely going away the watcher should not be left orphaned to age out on
+  # the heartbeat-idle backstop - the SessionEnd hook calls this to stop it now.
+  if stop_home_watcher; then
+    echo "watcher: stopped pid=$STOPPED_WATCHER_PID (session teardown)"
+  else
+    echo "watcher: none (session teardown)"
+  fi
+  exit 0
+fi
+
+if [ "$mode" = restart ]; then
+  # Home-scoped stop before relaunching a fresh cycle (see stop_home_watcher).
+  stop_home_watcher || true
 fi
 
 # If a genuinely live+fresh watcher already holds the lock, do not start a second

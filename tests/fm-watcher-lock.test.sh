@@ -757,6 +757,79 @@ test_watcher_survives_arm_term_reap_and_next_arm_reattaches() {
   pass "watcher survives its arm being reaped with SIGTERM and the next arm re-attaches to the same live watcher"
 }
 
+test_shutdown_stops_home_watcher_full_session_teardown() {
+  # The two-event distinction the SessionEnd path relies on: a routine arm reap
+  # must LEAVE the detached watcher running (proved by the tests above), but a
+  # genuine full-session teardown must explicitly STOP it via --shutdown instead
+  # of orphaning it. --shutdown is home-scoped and identity-verified: it stops
+  # only the live watcher this home's lock actually names.
+  local dir state fakebin armout shutout i armpid lock_pid status
+  dir=$(make_case shutdown-stops-watcher)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  shutout="$dir/shutdown.out"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$armout" || fail "arm did not start a watcher before shutdown"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$lock_pid" ] || fail "watcher took no lock before shutdown"
+  is_live_non_zombie "$lock_pid" || fail "watcher not alive before shutdown"
+
+  # Full-session teardown: --shutdown stops this home's watcher and exits 0
+  # without relaunching.
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" --shutdown > "$shutout" &
+  local shutpid=$!
+  wait_for_exit "$shutpid" 80
+  status=$?
+  [ "$status" -eq 0 ] || fail "--shutdown did not exit 0 (got $status)"
+  grep -qF "watcher: stopped pid=$lock_pid" "$shutout" || fail "--shutdown did not report stopping the home watcher: $(cat "$shutout")"
+  # The watcher this home armed must actually be gone.
+  wait_for_exit "$lock_pid" 80 >/dev/null 2>&1 || true
+  ! is_live_non_zombie "$lock_pid" || fail "--shutdown left the home watcher running"
+
+  # The reaped arm follows its now-stopped watcher out; clean it up.
+  wait_for_exit "$armpid" 80 >/dev/null 2>&1 || true
+  kill "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  pass "--shutdown stops this home's watcher on a full-session teardown"
+}
+
+test_shutdown_refuses_reused_or_foreign_pid() {
+  # --shutdown must never signal a pid the lock does not IDENTIFY as this home's
+  # watcher, exactly like --restart. A reused/foreign pid recorded in the lock is
+  # left untouched (only its stale lock is cleared).
+  local dir state fakebin shutout live status
+  dir=$(make_case shutdown-reused-pid)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  shutout="$dir/shutdown.out"
+  mark_pr_check_migration_complete "$state"
+  sleep 300 &
+  live=$!
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "stale watcher identity" > "$state/.watch.lock/pid-identity"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" --shutdown > "$shutout" &
+  local shutpid=$!
+  wait_for_exit "$shutpid" 80
+  status=$?
+  [ "$status" -eq 0 ] || fail "--shutdown did not exit 0 against a reused pid (got $status)"
+  grep -qF 'watcher: none' "$shutout" || fail "--shutdown did not report no watcher for a reused pid: $(cat "$shutout")"
+  is_live_non_zombie "$live" || fail "--shutdown killed a reused unrelated pid"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "--shutdown refuses to signal a reused or foreign pid"
+}
+
 test_arm_propagates_immediate_wake_before_confirmation() {
   local dir state fakebin armout drain_out check_file rc
   dir=$(make_case arm-immediate-wake)
@@ -1060,6 +1133,8 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals
 test_arm_hup_survives_watcher_and_cleans_temp_output
 test_watcher_survives_arm_term_reap_and_next_arm_reattaches
+test_shutdown_stops_home_watcher_full_session_teardown
+test_shutdown_refuses_reused_or_foreign_pid
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable

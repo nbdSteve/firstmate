@@ -25,8 +25,13 @@
 #     concurrent firing exits 0 without translating, which keeps one event
 #     epoch on exactly one recovery turn.
 #   - Foreground arm: the owner runs bin/fm-watch-arm.sh in the FOREGROUND of
-#     this hook-owned process tree (never shell &); Claude owns the process
-#     group, so its timeout/session teardown kills arm and watcher together.
+#     this hook-owned process tree (never shell &). The arm launches the watcher
+#     DETACHED in its own session, so reaping this hook tree (the hook timeout or
+#     Claude ending a turn) does NOT kill the watcher - that decoupling is the
+#     whole point, so a routine reap can no longer take supervision down. A
+#     genuine full-session teardown is handled separately by the SessionEnd hook
+#     (bin/fm-claude-sessionend-shutdown.sh), which explicitly stops this home's
+#     watcher instead of leaving it orphaned.
 #   - Translation: while supervision is still needed and AFK remains inactive,
 #     an actionable arm close (signal:/stale:/check:/heartbeat) or a typed
 #     watcher: FAILED prints one rewake banner to stderr and exits 2, which
@@ -134,8 +139,10 @@ write_epoch arming
 
 # --- foreground the real arm wrapper ------------------------------------------
 # NO shell &: this hook process tree is the harness-owned lifecycle. The arm
-# forks the watcher as its own tracked child exactly as it does for the
-# model-driven background-task path, and propagates the wake reason on close.
+# launches the watcher DETACHED in its own session (so a reap of this hook tree
+# leaves the watcher running) while still waiting on it via the exec-preserved
+# pid, exactly as it does for the model-driven background-task path, and
+# propagates the wake reason on close.
 OUT=$(mktemp "$STATE/.claude-autoarm-output.XXXXXX") || OUT=
 if [ -n "$OUT" ]; then
   "$SCRIPT_DIR/fm-watch-arm.sh" >"$OUT" 2>&1
