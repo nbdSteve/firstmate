@@ -71,10 +71,17 @@
 # --shutdown: stop ONLY this FM_HOME's watcher and exit WITHOUT relaunching, for
 # a genuine full-session teardown. A routine arm reap must still leave the
 # detached watcher running (the reaping fix above); --shutdown is the deliberate
-# counterpart the SessionEnd hook calls when the whole owning session is going
-# away, so the watcher is stopped now instead of orphaned until the heartbeat
-# idle-exit backstop retires it. Both modes share stop_home_watcher, the single
-# owner of the home-scoped, identity-verified stop.
+# counterpart a full-session-teardown hook calls when the whole owning session is
+# going away, so the watcher is stopped now instead of orphaned. The watcher has
+# NO idle self-exit; without this stop it keeps running indefinitely (beating,
+# holding the lock, polling) until an actionable wake, singleton self-eviction,
+# or a signal. Both modes share stop_home_watcher, the single owner of the
+# home-scoped, identity-verified stop.
+# Only Claude's SessionEnd hook (bin/fm-claude-sessionend-shutdown.sh), Pi's
+# session_shutdown handler, and OpenCode's genuine-teardown path call --shutdown;
+# Grok arms via .grok/hooks Stop hooks and exposes no session-teardown hook
+# surface, so a Grok primary's watcher cannot receive a deterministic teardown
+# shutdown and is stopped only by the next singleton self-eviction or a signal.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -382,8 +389,10 @@ if [ "$mode" = shutdown ]; then
   # relaunching. This is the deliberate counterpart to the detached lifetime. A
   # routine arm reap must leave the detached watcher running (that is the reaping
   # fix, and it stays untouched), but when the whole session that owns this home
-  # is genuinely going away the watcher should not be left orphaned to age out on
-  # the heartbeat-idle backstop - the SessionEnd hook calls this to stop it now.
+  # is genuinely going away the watcher should not be left orphaned. There is no
+  # idle self-exit, so an orphan runs indefinitely until an actionable wake,
+  # singleton self-eviction, or a signal - the teardown hook calls this to stop
+  # it now.
   if stop_home_watcher; then
     echo "watcher: stopped pid=$STOPPED_WATCHER_PID (session teardown)"
   else

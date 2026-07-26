@@ -11,11 +11,14 @@
 # Why this exists: bin/fm-watch-arm.sh launches the watcher DETACHED in its own
 # session so a routine arm reap no longer drags supervision down with it (the
 # reaping fix). The deliberate cost of that decoupling is that a full-session
-# teardown would otherwise leave the watcher ORPHANED until its heartbeat-idle
-# self-exit retires it. This hook closes that gap: when the owning session is
-# really going away it explicitly stops THIS home's watcher now, via
-# bin/fm-watch-arm.sh --shutdown, which is home-scoped and identity-verified. It
-# does NOT re-couple routine teardown to the watcher - only SessionEnd runs it.
+# teardown would otherwise leave the watcher ORPHANED and running indefinitely.
+# The watcher has NO idle self-exit: its main loop keeps beating, holding the
+# lock, polling, and enqueuing wakes nobody drains, and exits only on an
+# actionable wake, singleton self-eviction, or a signal. This hook closes that
+# gap: when the owning session is really going away it explicitly stops THIS
+# home's watcher now, via bin/fm-watch-arm.sh --shutdown, which is home-scoped
+# and identity-verified. It does NOT re-couple routine teardown to the watcher -
+# only SessionEnd runs it.
 #
 #   - reason=clear: /clear keeps the SAME session alive with a cleared context,
 #     so it is NOT a teardown. Skip it and leave the watcher running; the session
@@ -30,7 +33,9 @@
 #     this Claude session, so this hook must not stop it.
 #
 # It never blocks the session teardown and never prints to stdout. On any
-# uncertainty it exits 0 and leaves the watcher to the heartbeat-idle backstop.
+# uncertainty it exits 0 and leaves the watcher running; there is no self-retire
+# backstop, so the watcher keeps running until an actionable wake, singleton
+# self-eviction, or a signal.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,7 +1,7 @@
 // Firstmate primary watcher bridge for Pi.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
@@ -71,6 +71,7 @@ const retryMaxMs = positiveInteger("FM_WATCH_REARM_RETRY_MAX_MS", 4000);
 const retryLimit = positiveInteger("FM_WATCH_REARM_RETRY_LIMIT", 5);
 const armReadyTimeoutMs = positiveInteger("FM_PI_ARM_READY_TIMEOUT_MS", 12000);
 const armRetireTimeoutMs = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 1000);
+const armShutdownTimeoutMs = positiveInteger("FM_WATCH_ARM_SHUTDOWN_TIMEOUT_MS", 8000);
 const repairOnlyHint = "call fm_watch_arm_pi again only after a later notification says the cycle is missing, failed, or unhealthy";
 
 let child: ChildProcess | null = null;
@@ -124,6 +125,28 @@ function markLoaded(): void {
   if (lockOwnership() === "other") return;
   mkdirSync(state, { recursive: true });
   writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
+}
+
+// Genuine full-session teardown only: stop this home's DETACHED watcher instead
+// of orphaning it. The watcher outlives an arm reap by design (the reaping fix),
+// so ending an arm cycle never stops it; only a real Pi session_shutdown should.
+// Mirror the Claude SessionEnd gating: skip while away mode owns the watcher, and
+// act only when this session still owns the lock. bin/fm-watch-arm.sh --shutdown
+// owns the home-scoped, identity-verified stop; this never signals a pid itself.
+function shutdownDetachedWatcher(): void {
+  if (existsSync(`${state}/.afk`)) return;
+  if (lockOwnership() !== "owned") return;
+  spawnSync(armScript, ["--shutdown"], {
+    cwd: fmRoot,
+    env: {
+      ...process.env,
+      FM_HOME: fmHome,
+      FM_ROOT_OVERRIDE: fmRoot,
+      FM_CONFIG_OVERRIDE: config,
+    },
+    stdio: "ignore",
+    timeout: armShutdownTimeoutMs,
+  });
 }
 
 function actionableLine(output: string): string {
@@ -411,6 +434,7 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on?.("session_shutdown", () => {
     stopArm();
+    shutdownDetachedWatcher();
     process.off("exit", cleanupOnProcessExit);
   });
 
