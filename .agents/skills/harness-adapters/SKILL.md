@@ -98,6 +98,7 @@ Claude's Stop `asyncRewake` hook (`bin/fm-claude-stop-autoarm.sh`) owns tokenles
 Codex uses bounded foreground checkpoints through `bin/fm-watch-checkpoint.sh` because Codex cannot reason while a foreground tool call is running.
 OpenCode uses `.opencode/plugins/fm-primary-watch-arm.js`, which coordinates with the turn-end guard plugin and wakes the TUI with `client.session.promptAsync`.
 Pi uses the tracked `.pi/extensions/fm-primary-turnend-guard.ts` plus the tracked `.pi/extensions/fm-primary-pi-watch.ts`, both project-local extensions Pi auto-discovers once trusted.
+The arm wrapper launches the watcher detached, so a routine arm reap or hook-tree teardown never stops it; each runtime with a genuine full-session-teardown surface stops it through `bin/fm-watch-arm.sh --shutdown`, with the per-harness surfaces and the Grok limitation owned by `docs/architecture.md`.
 When changing any primary watcher adapter, update `docs/supervision-protocols/`, `docs/turnend-guard.md` if a shared idle or turn-end hook changed, and the relevant concise fact below.
 
 ## Launch profile axes
@@ -191,6 +192,7 @@ Claude Code's stdin payload to a Stop hook carries a `stop_hook_active` boolean 
 A project-level `.claude/settings.json` only takes effect when Claude Code's project root is that exact directory - it does not walk up from a subdirectory looking for one, so firstmate launches the primary from the repo root.
 After those settings are loaded, hook command resolution is still cwd-sensitive because Claude Code runs commands through `/bin/sh` against the session's current cwd; keep the tracked commands anchored through `"$CLAUDE_PROJECT_DIR"/bin/...` and see `docs/turnend-guard.md` for the verified Stop-hook details.
 Claude Code's primary watcher protocol is Stop-owned: the auto-arm hook fires on every Stop and foregrounds `bin/fm-watch-arm.sh` when the home is eligible and still needs supervision, and its exit-2 `asyncRewake` rewake is the wake; the model drains and handles wakes but never runs a routine re-arm command.
+The same tracked `.claude/settings.json` also registers a `SessionEnd` hook, `bin/fm-claude-sessionend-shutdown.sh`, which stops this home's detached watcher through `bin/fm-watch-arm.sh --shutdown` on a genuine full-session teardown; `docs/architecture.md` owns the cross-harness teardown surfaces.
 
 ## codex (VERIFIED 2026-06-11, codex-cli 0.139.0)
 

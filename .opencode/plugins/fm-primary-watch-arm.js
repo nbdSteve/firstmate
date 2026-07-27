@@ -1,11 +1,13 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { encodeFirstmateOperationalInput } from "./lib/fm-operational-input.js";
 
 const COORDINATOR_KEY = "__firstmateOpenCodeWatchArm";
+const TEARDOWN_KEY = "__firstmateOpenCodeWatchArmTeardown";
 const ARM_READY_TIMEOUT_MS = Number(process.env.FM_OPENCODE_ARM_READY_TIMEOUT_MS || 12000);
 const ARM_RETIRE_TIMEOUT_MS = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 1000);
+const ARM_SHUTDOWN_TIMEOUT_MS = positiveInteger("FM_WATCH_ARM_SHUTDOWN_TIMEOUT_MS", 8000);
 const REARM_RETRY_BASE_MS = positiveInteger("FM_WATCH_REARM_RETRY_BASE_MS", 250);
 const REARM_RETRY_MAX_MS = positiveInteger("FM_WATCH_REARM_RETRY_MAX_MS", 4000);
 const REARM_RETRY_LIMIT = positiveInteger("FM_WATCH_REARM_RETRY_LIMIT", 5);
@@ -123,6 +125,82 @@ async function sessionOwnsLock(paths) {
     if (!pid || pid === "1") return false;
   }
   return false;
+}
+
+// Synchronous lock-ownership check for the teardown path only. A process-exit
+// handler runs after the event loop stops, so it cannot await the async ps walk
+// above; this mirrors that walk with spawnSync so teardown never signals a
+// foreign or reused pid.
+function sessionOwnsLockSync(paths) {
+  let lockPid = "";
+  try {
+    lockPid = readFileSync(`${paths.state}/.lock`, "utf8").trim();
+  } catch {
+    return false;
+  }
+  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return false;
+  let pid = String(process.pid);
+  for (let i = 0; i < 8; i += 1) {
+    if (pid === lockPid) return true;
+    const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
+    if (result.status !== 0) return false;
+    pid = (result.stdout || "").trim();
+    if (!pid || pid === "1") return false;
+  }
+  return false;
+}
+
+// Genuine full-session teardown only: stop this home's DETACHED watcher instead
+// of orphaning it. OpenCode exposes no teardown bus event and no plugin
+// lifecycle hook, and its plugin process lives for the whole TUI session, so the
+// process exiting IS the teardown signal. The stop must be synchronous
+// (spawnSync) because an exit handler runs after the event loop stops; async
+// spawn, promises, and timers would never execute. Mirror the Claude SessionEnd
+// gating: skip while away mode owns the watcher, and act only when this session
+// still owns the lock. bin/fm-watch-arm.sh --shutdown owns the home-scoped,
+// identity-verified stop; this never signals a pid itself. Ending an arm cycle
+// or a routine reap must still leave the detached watcher running.
+function shutdownDetachedWatcher(paths) {
+  if (existsSync(`${paths.state}/.afk`)) return;
+  if (!sessionOwnsLockSync(paths)) return;
+  spawnSync(`${paths.root}/bin/fm-watch-arm.sh`, ["--shutdown"], {
+    cwd: paths.root,
+    env: {
+      ...process.env,
+      FM_HOME: paths.home,
+      FM_ROOT_OVERRIDE: paths.root,
+      FM_CONFIG_OVERRIDE: paths.config,
+    },
+    stdio: "ignore",
+    timeout: ARM_SHUTDOWN_TIMEOUT_MS,
+  });
+}
+
+// Install the teardown handlers once per process. The plugin factory can run per
+// session, but there is one primary home per process, so a single install with
+// the first resolved paths matches Pi's module-scope install. process.once("exit")
+// covers a graceful process exit; the signal handlers cover a terminating signal.
+// Adding a signal listener suppresses Node's default terminate, so each handler
+// re-raises the signal once it is the sole listener - it never hangs the process
+// and never truncates OpenCode's own shutdown if that also listens.
+function installTeardownHandlers(paths) {
+  if (globalThis[TEARDOWN_KEY]) return;
+  let done = false;
+  const teardown = () => {
+    if (done) return;
+    done = true;
+    shutdownDetachedWatcher(paths);
+  };
+  globalThis[TEARDOWN_KEY] = teardown;
+  process.once("exit", teardown);
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    const onSignal = () => {
+      teardown();
+      process.removeListener(signal, onSignal);
+      if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+    };
+    process.on(signal, onSignal);
+  }
 }
 
 function classifyArmClose(stdout, stderr, code, signal) {
@@ -413,6 +491,9 @@ export const FmPrimaryWatchArm = async ({ client, directory, worktree }) => {
   globalThis[COORDINATOR_KEY] = {
     ensureArmed: (sessionID, activeClient) => ensureArm(paths, sessionID, activeClient ?? client),
   };
+  // Only a genuine primary home stops its detached watcher on teardown; child
+  // crew/scout worktrees stay inert, matching the arm scope gate.
+  if (await isPrimaryRoot(paths.root, paths.home)) installTeardownHandlers(paths);
 
   return {
     event: async ({ event }) => {

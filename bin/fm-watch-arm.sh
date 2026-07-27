@@ -20,8 +20,20 @@
 # docs/arm-pretool-check.md for the blessed tree and deny reason codes. It is a
 # pre-execution seatbelt, not a substitute for the verification here.
 #
-# This script forks the watcher as a tracked child, then VERIFIES the outcome
-# before it settles in. It confirms a watcher process is genuinely alive AND the
+# This script launches the watcher DETACHED in its own session (perl
+# POSIX::setsid + exec; setsid(1) is absent on macOS bash) so the watcher's
+# lifetime is INDEPENDENT of this arm, then VERIFIES the outcome before it settles
+# in. exec keeps $! equal to the watcher's real pid, so the arm still `wait`s on
+# it (which is what makes the harness re-notify firstmate when the watcher wakes
+# and exits) and lock-identity confirmation, `wait`, and --restart all target the
+# true watcher. The point of the detach is the reap: the harness reaps this arm
+# (its tracked background task) every minute or two with SIGTERM, and a detached
+# watcher SURVIVES that reap - it keeps beating and holding the lock, and the next
+# arm attaches to it, so supervision is never dropped between re-arms. Durable
+# wake delivery never depends on this arm at all: fm-watch.sh enqueues every wake
+# to state/.wake-queue before it prints and exits, and firstmate drains that queue
+# at the start of every turn.
+# It confirms a watcher process is genuinely alive AND the
 # liveness beacon (state/.last-watcher-beat) is fresh within FM_GUARD_GRACE (the
 # single source of truth, shared with fm-watch.sh and fm-guard.sh), and prints
 # exactly one unambiguous status line:
@@ -56,6 +68,20 @@
 # watcher. NEVER `pkill -f
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
 # (secondmate homes run the same script) and would kill siblings.
+# --shutdown: stop ONLY this FM_HOME's watcher and exit WITHOUT relaunching, for
+# a genuine full-session teardown. A routine arm reap must still leave the
+# detached watcher running (the reaping fix above); --shutdown is the deliberate
+# counterpart a full-session-teardown hook calls when the whole owning session is
+# going away, so the watcher is stopped now instead of orphaned. The watcher has
+# NO idle self-exit; without this stop it keeps running indefinitely (beating,
+# holding the lock, polling) until an actionable wake, singleton self-eviction,
+# or a signal. Both modes share stop_home_watcher, the single owner of the
+# home-scoped, identity-verified stop.
+# Only Claude's SessionEnd hook (bin/fm-claude-sessionend-shutdown.sh), Pi's
+# session_shutdown handler, and OpenCode's genuine-teardown path call --shutdown;
+# Grok arms via .grok/hooks Stop hooks and exposes no session-teardown hook
+# surface, so a Grok primary's watcher cannot receive a deterministic teardown
+# shutdown and is stopped only by the next singleton self-eviction or a signal.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -318,31 +344,66 @@ print_watch_output() {
   [ -s "$out" ] && cat "$out"
 }
 
-mode=arm
-case "${1:-}" in
-  ''|arm|--arm) mode=arm ;;
-  --restart) mode=restart ;;
-  *) echo "usage: $(basename "$0") [--restart]" >&2; exit 2 ;;
-esac
-
-if [ "$mode" = restart ]; then
-  # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
+# Home-scoped stop of ONLY this FM_HOME's watcher: the pid recorded in this
+# home's state/.watch.lock, and only when the lock still IDENTIFIES that live pid
+# as this home's watcher. It never signals a reused/unrelated pid, never another
+# home's watcher, and never uses a broad pkill. Sets STOPPED_WATCHER_PID to the
+# pid it terminated and returns 0 only when it stopped a genuine live watcher; a
+# dead-pid lock is left for the arm's steal path (--restart) to reclaim, and a
+# live-but-foreign (reused) pid only has its stale lock cleared. This is the one
+# owner of the home-scoped stop, shared by --restart and --shutdown.
+STOPPED_WATCHER_PID=
+stop_home_watcher() {
+  local lock_pid i
+  STOPPED_WATCHER_PID=
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
     if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
       kill -TERM "$lock_pid" 2>/dev/null || true
-      # Wait for it to actually exit before relaunching, so the fresh watcher
-      # either takes a released lock or reclaims a now-dead-pid stale lock instead
-      # of seeing the dying one as a live holder and no-opping.
+      # Wait for it to actually exit so the lock is released (or left as a
+      # now-dead-pid stale lock) instead of naming a dying holder a later arm
+      # would mistake for a live watcher and no-op against.
       i=0
       while [ "$i" -lt 50 ] && fm_pid_alive "$lock_pid"; do
         sleep 0.1
         i=$((i + 1))
       done
-    else
-      clear_stale_recorded_watcher_lock
+      STOPPED_WATCHER_PID=$lock_pid
+      return 0
     fi
+    clear_stale_recorded_watcher_lock
   fi
+  return 1
+}
+
+mode=arm
+case "${1:-}" in
+  ''|arm|--arm) mode=arm ;;
+  --restart) mode=restart ;;
+  --shutdown) mode=shutdown ;;
+  *) echo "usage: $(basename "$0") [--restart|--shutdown]" >&2; exit 2 ;;
+esac
+
+if [ "$mode" = shutdown ]; then
+  # Full-session teardown ONLY: stop this home's watcher and exit without
+  # relaunching. This is the deliberate counterpart to the detached lifetime. A
+  # routine arm reap must leave the detached watcher running (that is the reaping
+  # fix, and it stays untouched), but when the whole session that owns this home
+  # is genuinely going away the watcher should not be left orphaned. There is no
+  # idle self-exit, so an orphan runs indefinitely until an actionable wake,
+  # singleton self-eviction, or a signal - the teardown hook calls this to stop
+  # it now.
+  if stop_home_watcher; then
+    echo "watcher: stopped pid=$STOPPED_WATCHER_PID (session teardown)"
+  else
+    echo "watcher: none (session teardown)"
+  fi
+  exit 0
+fi
+
+if [ "$mode" = restart ]; then
+  # Home-scoped stop before relaunching a fresh cycle (see stop_home_watcher).
+  stop_home_watcher || true
 fi
 
 # If a genuinely live+fresh watcher already holds the lock, do not start a second
@@ -357,18 +418,32 @@ if [ "$mode" = arm ] && healthy_watcher; then
   exit $?
 fi
 
-# Start a watcher as a tracked child and confirm it before settling in. The child
-# stays our child for its whole life: we wait on it, so killing this arm (the
-# harness-tracked task) tears the watcher down too, and the watcher's eventual
-# wake exit propagates out so the harness re-notifies firstmate.
+# Launch the watcher DETACHED and confirm it before settling in. It runs in its
+# own session (perl POSIX::setsid + exec), so it OUTLIVES this arm: when the
+# harness reaps this tracked background task with SIGTERM, the watcher keeps
+# beating and holding the lock, and the next arm attaches to it. $child holds the
+# watcher's real pid (exec preserves $!), so the arm still `wait`s on it for the
+# harness push and can still stop an unconfirmed launch on the timeout path. On a
+# clean signal the arm exits WITHOUT touching the watcher - tearing it down is the
+# exact reaping bug this detach fixes.
 child=
 child_out=
-cleanup_child() {
-  if [ -n "$child" ] && fm_pid_alive "$child"; then
-    kill -TERM "$child" 2>/dev/null || true
-  fi
+# Remove only the temp output. NEVER kill $child here: the watcher is detached
+# and must survive an arm signal/reap. The confirmation-timeout path that wants
+# to stop an unconfirmed launch does so explicitly via stop_unconfirmed_child.
+cleanup_child_output() {
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
+  fi
+}
+
+# Stop a watcher this arm launched but could NEVER confirm healthy (the
+# confirmation-timeout fallback only). Signaling the real watcher pid releases its
+# lock so the next arm starts clean instead of colliding with a wedged launch.
+# This is never called on the signal/reap path, where the watcher must survive.
+stop_unconfirmed_child() {
+  if [ -n "$child" ] && fm_pid_alive "$child"; then
+    kill -TERM "$child" 2>/dev/null || true
   fi
 }
 
@@ -376,12 +451,11 @@ cleanup_child() {
 handle_arm_signal() {
   local signal=$1 rc=$2
   trap - HUP TERM INT
-  if [ -n "$child" ] && fm_pid_alive "$child"; then
-    kill -TERM "$child" 2>/dev/null || true
-    wait "$child" 2>/dev/null || true
-  fi
+  # The watcher is detached and must OUTLIVE this arm: record the interrupted
+  # cycle and exit without signaling $child. This is the reaping fix - a harness
+  # SIGTERM to this arm no longer takes supervision down with it.
   cycle_log_append "$rc" "$signal" arm-interrupted none
-  cleanup_child
+  cleanup_child_output
   exit "$rc"
 }
 
@@ -393,7 +467,12 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-"$WATCH" >"$child_out" &
+# Detach the watcher into its own session so it outlives this arm's reaping.
+# setsid(1) is not present on macOS bash 3.2; perl's POSIX::setsid is. exec keeps
+# $! equal to the watcher's real pid, so `wait "$child"` below still reaps the
+# real watcher and returns its true exit code for the harness push path.
+# shellcheck disable=SC2016  # single quotes are deliberate: perl expands its own $ARGV.
+perl -e 'use POSIX (); POSIX::setsid(); exec { $ARGV[0] } @ARGV; exit 127;' "$WATCH" >"$child_out" 2>&1 &
 child=$!
 cycle_begin "$child" started
 child_done=0
@@ -484,7 +563,12 @@ done
 
 trap - HUP TERM INT
 print_watch_output "$child_out"
-cleanup_child
+# The launch was never confirmed healthy within the deadline. Stop that
+# unconfirmed watcher so its lock is released and the next arm starts clean; this
+# is the ONLY path that stops the detached watcher, and only because it is not a
+# confirmed member of the supervision chain.
+stop_unconfirmed_child
+cleanup_child_output
 wait "$child" 2>/dev/null
 rc=$?
 cycle_log_append "$rc" "$(cycle_signal_name "$rc")" confirmation-timeout none

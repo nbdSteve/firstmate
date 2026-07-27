@@ -98,6 +98,8 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" 'details: result' "tracked extension tool is missing structured result details"
   assert_contains "$text" 'ctx.ui.notify' "tracked extension command does not notify through Pi's UI"
   assert_contains "$text" 'process.once("exit", cleanupOnProcessExit)' "tracked extension lacks clean-process-exit cleanup"
+  assert_contains "$text" 'spawnSync(armScript, ["--shutdown"]' "tracked extension does not stop the detached watcher on teardown via --shutdown"
+  assert_contains "$text" "shutdownDetachedWatcher();" "tracked extension session_shutdown does not stop the detached watcher"
   assert_not_contains "$text" "[ -f config/x-mode.env ]" "tracked extension kept a repo-relative x-mode config path"
   pass "Pi primary watcher extension is tracked, self-hashing, and self-locating"
 }
@@ -1030,6 +1032,169 @@ EOF
   pass "Pi process-exit cleanup stops the attached arm child"
 }
 
+# A fake arm that records a --shutdown call and otherwise behaves like a started
+# arm. --shutdown is the genuine full-session-teardown stop; --restart is the
+# routine arm that must NOT be confused with it.
+install_recording_arm_script() {
+  local repo=$1
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "--shutdown" ]; then
+  printf 'shutdown home=%s\n' "$FM_HOME" >> "$FM_SHUTDOWN_LOG"
+  exit 0
+fi
+printf 'watcher: started pid=1 (beacon fresh)\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+}
+
+test_pi_session_shutdown_stops_detached_watcher() {
+  # Genuine full-session teardown: session_shutdown must stop this home's
+  # DETACHED watcher via bin/fm-watch-arm.sh --shutdown. The routine process-exit
+  # cleanup must NOT (it only stops the local arm child) - the two-event
+  # distinction the reaping fix relies on.
+  local repo home plugin shutdown_log out status
+  repo="$TMP_ROOT/pi-session-shutdown-root"
+  home="$TMP_ROOT/pi-session-shutdown-home"
+  shutdown_log="$TMP_ROOT/pi-session-shutdown.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  install_recording_arm_script "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  : > "$shutdown_log"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_SHUTDOWN_LOG="$shutdown_log" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendUserMessage: async () => {},
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, {});
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi session_shutdown must stop the detached watcher"
+  [ -z "$out" ] || fail "Pi session_shutdown test printed output: $out"
+  grep -qF "shutdown home=$home" "$shutdown_log" \
+    || fail "Pi session_shutdown did not invoke fm-watch-arm.sh --shutdown: $(cat "$shutdown_log")"
+  [ "$(grep -c 'shutdown' "$shutdown_log")" -eq 1 ] \
+    || fail "Pi session_shutdown invoked --shutdown more than once: $(cat "$shutdown_log")"
+  pass "Pi session_shutdown stops this home's detached watcher via --shutdown"
+}
+
+test_pi_process_exit_does_not_shutdown_detached_watcher() {
+  # The routine reap path (generic process exit) must leave the detached watcher
+  # running: it never calls --shutdown, only session_shutdown does.
+  local repo home plugin shutdown_log out status
+  repo="$TMP_ROOT/pi-exit-no-shutdown-root"
+  home="$TMP_ROOT/pi-exit-no-shutdown-home"
+  shutdown_log="$TMP_ROOT/pi-exit-no-shutdown.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  install_recording_arm_script "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  : > "$shutdown_log"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_SHUTDOWN_LOG="$shutdown_log" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool() {},
+  sendUserMessage: async () => {},
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+// Fire the generic process-exit cleanup (a routine reap), never session_shutdown.
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi process-exit cleanup must not error"
+  [ -z "$out" ] || fail "Pi exit-no-shutdown test printed output: $out"
+  [ ! -s "$shutdown_log" ] \
+    || fail "Pi process-exit cleanup wrongly invoked --shutdown: $(cat "$shutdown_log")"
+  pass "Pi routine process exit leaves the detached watcher running (no --shutdown)"
+}
+
+test_pi_session_shutdown_skips_afk_and_unowned() {
+  # Mirror the Claude SessionEnd gating: skip while away mode owns the watcher,
+  # and act only when this session still owns the lock. Neither an away-mode home
+  # nor a session that does not own the lock may stop the watcher.
+  local repo home plugin shutdown_log out status
+  repo="$TMP_ROOT/pi-shutdown-gate-root"
+  home="$TMP_ROOT/pi-shutdown-gate-home"
+  shutdown_log="$TMP_ROOT/pi-shutdown-gate.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  install_recording_arm_script "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  : > "$shutdown_log"
+  # (a) away mode present, lock owned -> no --shutdown.
+  : > "$home/state/.afk"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_SHUTDOWN_LOG="$shutdown_log" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendUserMessage: async () => {},
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, {});
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi session_shutdown must not error under away mode"
+  [ -z "$out" ] || fail "Pi afk-gate test printed output: $out"
+  [ ! -s "$shutdown_log" ] \
+    || fail "Pi session_shutdown ran --shutdown while away mode owns the watcher: $(cat "$shutdown_log")"
+  rm -f "$home/state/.afk"
+
+  # (b) lock owned by a dead/foreign pid -> no --shutdown.
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_SHUTDOWN_LOG="$shutdown_log" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendUserMessage: async () => {},
+};
+// A pid this session cannot own.
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, {});
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi session_shutdown must not error without lock ownership"
+  [ -z "$out" ] || fail "Pi unowned-gate test printed output: $out"
+  [ ! -s "$shutdown_log" ] \
+    || fail "Pi session_shutdown ran --shutdown without owning the lock: $(cat "$shutdown_log")"
+  pass "Pi session_shutdown skips --shutdown under away mode or an unowned lock"
+}
+
 test_opencode_primary_watch_plugin_static_wiring() {
   local plugin module_boundary text
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -1047,6 +1212,9 @@ test_opencode_primary_watch_plugin_static_wiring() {
   assert_contains "$text" "sessionOwnsLock" "OpenCode plugin does not gate arm attempts on the session lock"
   assert_contains "$text" 'fm-watch-arm.sh" --restart' "OpenCode plugin does not restart into its own watcher child"
   assert_contains "$text" 'setArmStatus("external")' "OpenCode plugin still treats an external healthy watcher as armed"
+  assert_contains "$text" 'fm-watch-arm.sh`, ["--shutdown"]' "OpenCode plugin does not stop the detached watcher on teardown via --shutdown"
+  assert_contains "$text" "installTeardownHandlers" "OpenCode plugin does not install a genuine-teardown handler"
+  assert_contains "$text" 'process.once("exit"' "OpenCode plugin teardown lacks a synchronous process-exit fallback"
   pass "OpenCode primary watcher plugin has the verified TUI wake wiring"
 }
 
@@ -1998,6 +2166,134 @@ EOF
   pass "OpenCode healthy arm output does not suppress the turn-end guard"
 }
 
+test_opencode_process_exit_stops_detached_watcher() {
+  # OpenCode exposes no teardown bus event and its plugin process lives for the
+  # whole TUI session, so a genuine process exit IS the full-session teardown. It
+  # must stop this home's DETACHED watcher via bin/fm-watch-arm.sh --shutdown,
+  # gated on primary scope and lock ownership, mirroring the Claude SessionEnd
+  # remedy. Ending an arm cycle or a routine reap must still leave it running.
+  local plugin repo home shutdown_log out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-teardown-root"
+  home="$TMP_ROOT/opencode-teardown-home"
+  shutdown_log="$TMP_ROOT/opencode-teardown.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  install_recording_arm_script "$repo"
+  : > "$shutdown_log"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_SHUTDOWN_LOG="$shutdown_log" node 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const client = { session: { promptAsync: async () => {} } };
+await mod.FmPrimaryWatchArm({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode teardown must not error on genuine process exit"
+  [ -z "$out" ] || fail "OpenCode teardown test printed output: $out"
+  grep -qF "shutdown home=$home" "$shutdown_log" \
+    || fail "OpenCode process exit did not invoke fm-watch-arm.sh --shutdown: $(cat "$shutdown_log")"
+  [ "$(grep -c 'shutdown' "$shutdown_log")" -eq 1 ] \
+    || fail "OpenCode process exit invoked --shutdown more than once: $(cat "$shutdown_log")"
+  pass "OpenCode genuine process exit stops this home's detached watcher via --shutdown"
+}
+
+test_opencode_teardown_skips_afk_unowned_and_non_primary() {
+  # Mirror the Claude SessionEnd gating and arm scope: skip while away mode owns
+  # the watcher, skip without lock ownership, and never install teardown in a
+  # non-primary (child crew/scout) worktree.
+  local plugin repo home nonrepo shutdown_log out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-teardown-gate-root"
+  home="$TMP_ROOT/opencode-teardown-gate-home"
+  shutdown_log="$TMP_ROOT/opencode-teardown-gate.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  install_recording_arm_script "$repo"
+  : > "$shutdown_log"
+
+  # (a) away mode present, lock owned -> no --shutdown.
+  : > "$home/state/.afk"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_SHUTDOWN_LOG="$shutdown_log" node 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+await mod.FmPrimaryWatchArm({
+  client: { session: { promptAsync: async () => {} } },
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode teardown must not error under away mode"
+  [ -z "$out" ] || fail "OpenCode teardown afk-gate test printed output: $out"
+  [ ! -s "$shutdown_log" ] \
+    || fail "OpenCode teardown ran --shutdown while away mode owns the watcher: $(cat "$shutdown_log")"
+  rm -f "$home/state/.afk"
+
+  # (b) lock owned by a foreign pid -> no --shutdown.
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_SHUTDOWN_LOG="$shutdown_log" node 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+await mod.FmPrimaryWatchArm({
+  client: { session: { promptAsync: async () => {} } },
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode teardown must not error without lock ownership"
+  [ -z "$out" ] || fail "OpenCode teardown unowned-gate test printed output: $out"
+  [ ! -s "$shutdown_log" ] \
+    || fail "OpenCode teardown ran --shutdown without owning the lock: $(cat "$shutdown_log")"
+
+  # (c) non-primary worktree -> teardown never installed, so exit runs no --shutdown.
+  nonrepo="$TMP_ROOT/opencode-teardown-nonprimary"
+  mkdir -p "$nonrepo/bin"
+  install_recording_arm_script "$nonrepo"
+  # No AGENTS.md and no git repo makes isPrimaryRoot false.
+  out=$(PLUGIN="$plugin" WORKTREE="$nonrepo" FM_HOME="$nonrepo" FM_SHUTDOWN_LOG="$shutdown_log" node 2>&1 <<'EOF'
+import { mkdirSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+await mod.FmPrimaryWatchArm({
+  client: { session: { promptAsync: async () => {} } },
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+mkdirSync(`${process.env.FM_HOME}/state`, { recursive: true });
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode non-primary teardown must not error"
+  [ -z "$out" ] || fail "OpenCode non-primary teardown test printed output: $out"
+  [ ! -s "$shutdown_log" ] \
+    || fail "OpenCode installed teardown in a non-primary worktree: $(cat "$shutdown_log")"
+  pass "OpenCode teardown skips --shutdown under away mode, an unowned lock, or a non-primary worktree"
+}
+
 test_tracked_extension_present_and_self_hashing
 test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher
@@ -2014,6 +2310,9 @@ test_pi_actionable_close_rechecks_session_lock
 test_pi_arm_distinguishes_session_lock_ownership
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_process_exit_cleanup_stops_arm_child
+test_pi_session_shutdown_stops_detached_watcher
+test_pi_process_exit_does_not_shutdown_detached_watcher
+test_pi_session_shutdown_skips_afk_and_unowned
 test_opencode_primary_watch_plugin_static_wiring
 test_opencode_plugin_package_boundary_is_explicit_esm
 test_opencode_primary_watch_plugin_uses_effective_state_home
@@ -2030,3 +2329,5 @@ test_opencode_established_empty_close_honors_retry_limit
 test_opencode_actionable_close_rechecks_session_lock
 test_opencode_watch_arm_coordinates_with_turnend_guard
 test_opencode_healthy_arm_output_does_not_suppress_guard
+test_opencode_process_exit_stops_detached_watcher
+test_opencode_teardown_skips_afk_unowned_and_non_primary
