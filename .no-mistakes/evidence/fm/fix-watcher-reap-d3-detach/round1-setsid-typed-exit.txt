@@ -1,0 +1,33 @@
+Round-1 fix: unimplemented POSIX::setsid() maps to the documented 126 typed refusal
+target commit f46a05d ; base of range a6618dd ; intermediate detach 7874ac1
+
+Exact DETACH_EXEC program the arm passes to 'perl -e' (from bin/fm-watch-arm.sh):
+----
+use POSIX ();
+eval { POSIX::setsid(); 1 } or exit 126;
+exit 126 unless POSIX::getpgrp() == $$;
+exec { $ARGV[0] } @ARGV;
+exit 127;
+----
+
+Simulated unsupported platform: a shadow POSIX.pm whose setsid() croaks,
+exactly like native Win32 perl reachable from a Git Bash PATH (this script's
+msys branch). Injected via PERL5LIB so the arm's OWN program decides the exit.
+
+[A] TARGET program, croaking setsid  -> expect 126 (documented refusal)
+   exit=126
+
+[B] PRE-FIX program (7874ac1, unguarded setsid), same croaking setsid -> uncontrolled 255
+   exit=255   (this is the defect the round fixes: untyped 255, not 126)
+
+[C] TARGET program, setsid returns but process group did NOT move -> cannot verify -> 126
+   exit=126
+
+[D] TARGET program, setsid+getpgrp OK -> exec reaches the watcher (/usr/bin/true) -> 0
+   exit=0
+
+[E] TARGET program, setsid+getpgrp OK but watcher cannot be executed -> 127
+   exit=127
+
+127 is reserved for perl/watcher-cannot-execute; 126 for a detach that
+cannot be verified. Distinct, as the header contract documents.

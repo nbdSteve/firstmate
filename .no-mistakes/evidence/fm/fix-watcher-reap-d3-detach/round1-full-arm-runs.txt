@@ -1,0 +1,12 @@
+Full real arm (bin/fm-watch-arm.sh) driven end-to-end, no mocks of the arm.
+
+=== ARM RUN 1: unimplemented setsid (PERL5LIB shadow POSIX::setsid croaks) ===
+watcher: FAILED - watcher cycle exited 126 without an actionable reason
+arm exit=126  (documented 126 typed refusal)
+
+=== ARM RUN 2: perl/watcher cannot be executed (launcher exits 127) ===
+watcher: FAILED - watcher cycle exited 127 without an actionable reason
+arm exit=127  (127 preserved for cannot-execute)
+
+Both runs print exactly one honest 'watcher: FAILED ...' line on stdout and
+NEVER 'watcher: started'; the arm certifies no watcher when the detach fails.

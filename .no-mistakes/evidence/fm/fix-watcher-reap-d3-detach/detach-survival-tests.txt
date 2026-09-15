@@ -1,0 +1,2 @@
+ok - detached watcher survives its arm's HUP and keeps its lock while the arm cleans its temp output
+ok - watcher survives its arm being reaped with SIGTERM and the next arm re-attaches to the same live watcher
